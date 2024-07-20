@@ -1,0 +1,175 @@
+#!/bin/bash
+
+# Define the profile directory and log file
+PROFILE_DIR="$HOME/.config/y.sh/profiles"
+LOG_FILE="$HOME/.config/y.sh/y.log"
+DEFAULT_PROFILE="album.conf"
+BASE_DIR="$HOME/music/albums"
+
+# Initialize variables
+PROFILE="$PROFILE_DIR/$DEFAULT_PROFILE"
+PLAY_IMMEDIATELY=false
+SHOW_MENU=false
+
+# Function to print usage
+usage() {
+    echo "Usage: $0 [-w] [-m] [profile] <YouTube URL>"
+    echo "  -w         Play the file in mpv immediately after download"
+    echo "  -m         Show a menu of previously downloaded files to play"
+    echo "  profile    Optional profile name (default is 'default')"
+    echo "  URL        The YouTube URL to download"
+    exit 1
+}
+
+# Function to install yt-dlp from GitHub
+install_yt_dlp() {
+    if ! command -v yt-dlp >/dev/null 2>&1; then
+        echo "yt-dlp is required but not installed. Attempting to install..."
+        mkdir -p ~/.local/bin
+        curl -L https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp -o ~/.local/bin/yt-dlp
+        chmod a+rx ~/.local/bin/yt-dlp
+        export PATH=$PATH:$HOME/.local/bin
+    fi
+}
+
+# Function to install a package if not already installed
+install_if_missing() {
+    local pkg="$1"
+    local cmd="$2"
+    if ! command -v $cmd >/dev/null 2>&1; then
+        echo "$cmd is required but not installed. Attempting to install..."
+        if [ -f /etc/debian_version ]; then
+            sudo apt-get update && sudo apt-get install -y $pkg
+        elif [ -f /etc/arch-release ]; then
+            sudo pacman -Sy --noconfirm $pkg
+        elif [ -f /etc/fedora-release ]; then
+            sudo dnf install -y $pkg
+        elif [ -f /etc/SuSE-release ]; then
+            sudo zypper install -y $pkg
+        else
+            echo "Unsupported package manager. Please install $pkg manually."
+            exit 1
+        fi
+    fi
+}
+
+# Install yt-dlp from GitHub
+install_yt_dlp
+
+# Check for other dependencies and install if missing
+install_if_missing "mpv" "mpv"
+install_if_missing "fzf" "fzf"
+install_if_missing "ffmpeg" "ffmpeg"
+
+# Parse arguments
+while getopts ":wm" opt; do
+    case $opt in
+        w) PLAY_IMMEDIATELY=true ;;
+        m) SHOW_MENU=true ;;
+        \?) echo "Invalid option: -$OPTARG" >&2; usage ;;
+    esac
+done
+shift $((OPTIND - 1))
+
+# Show menu if -m flag is set
+if [ "$SHOW_MENU" = true ]; then
+    if [ -f "$LOG_FILE" ]; then
+        SELECTED_FILE=$(cat "$LOG_FILE" | fzf --prompt="Select a file to play: ")
+        if [ -n "$SELECTED_FILE" ]; then
+            mpv "$SELECTED_FILE" &
+        else
+            echo "No file selected."
+        fi
+    else
+        echo "No downloaded files log found."
+    fi
+    exit 0
+fi
+
+# Determine if the first argument is a profile or URL
+if [ $# -eq 1 ]; then
+    URL="$1"
+elif [ $# -eq 2 ]; then
+    PROFILE="$PROFILE_DIR/$1.conf"
+    URL="$2"
+else
+    usage
+fi
+
+# Check if the profile file exists
+if [ ! -f "$PROFILE" ]; then
+    echo "Profile $PROFILE not found!"
+    exit 1
+fi
+
+# Check if a URL argument is provided
+if [ -z "$URL" ]; then
+    usage
+fi
+
+# Special behavior for album profile
+if [ "$(basename "$PROFILE")" == "album.conf" ]; then
+    read -p "Use playlist # as track # (y/N)? " USE_PLAYLIST_TRACK
+    read -p "Override Artist? " OVERRIDE_ARTIST
+    read -p "Override Album? " OVERRIDE_ALBUM
+    read -p "Override Cover Art (URL)? " OVERRIDE_COVER_ART
+    read -p "Year? " YEAR
+
+    # Construct yt-dlp options based on user input
+    YT_DLP_OPTS=""
+    [ "$USE_PLAYLIST_TRACK" == "y" ] && YT_DLP_OPTS+=" --parse-metadata 'playlist_index:%(track_number)s'"
+
+    if [ -n "$OVERRIDE_ALBUM" ]; then
+        YT_DLP_OPTS+=" --output \"$BASE_DIR/$OVERRIDE_ARTIST - $YEAR - $OVERRIDE_ALBUM - %(playlist_index|)02d - %(title)s.%(ext)s\""
+    else
+        YT_DLP_OPTS+=" --output \"$BASE_DIR/$OVERRIDE_ARTIST - $YEAR - %(playlist_index|)02d - %(title)s.%(ext)s\""
+    fi
+
+    [ -n "$OVERRIDE_ARTIST" ] && YT_DLP_OPTS+=" --metadata-from-title \"$OVERRIDE_ARTIST\""
+    [ -n "$OVERRIDE_ALBUM" ] && YT_DLP_OPTS+=" --metadata-from-title \"$OVERRIDE_ALBUM\""
+fi
+
+# Run yt-dlp with the specified profile and options
+eval yt-dlp --config-location "$PROFILE" $YT_DLP_OPTS "$URL"
+if [ $? -ne 0 ]; then
+    echo "yt-dlp failed to download the video."
+    exit 1
+fi
+
+# Convert to mp3 if necessary and rename the files to follow the convention
+if [ "$(basename "$PROFILE")" == "album.conf" ]; then
+    for file in "$BASE_DIR"/*.webm; do
+        [ -e "$file" ] || continue
+        BASENAME=$(basename "$file" .webm)
+        NEW_FILENAME="${BASENAME}.mp3"
+        ffmpeg -i "$file" "$BASE_DIR/$NEW_FILENAME"
+        rm "$file"
+    done
+fi
+
+# Download the cover art if specified
+if [ -n "$OVERRIDE_COVER_ART" ]; then
+    for file in "$BASE_DIR"/*.mp3; do
+        [ -e "$file" ] || continue
+        COVER_ART_PATH="${file%.*}.jpg"
+        curl -L "$OVERRIDE_COVER_ART" -o "$COVER_ART_PATH"
+        # Embed the cover art using ffmpeg
+        ffmpeg -i "$file" -i "$COVER_ART_PATH" -map 0 -map 1 -c copy -disposition:v:0 attached_pic "${file%.*}_with_cover.mp3"
+        mv "${file%.*}_with_cover.mp3" "$file"
+        rm "$COVER_ART_PATH"
+    done
+fi
+
+# Log the downloaded files
+for file in "$BASE_DIR"/*.mp3; do
+    [ -e "$file" ] || continue
+    echo "$file" >> "$LOG_FILE"
+done
+
+# Play the file in mpv if requested
+if [ "$PLAY_IMMEDIATELY" = true ]; then
+    for file in "$BASE_DIR"/*.mp3; do
+        [ -e "$file" ] || continue
+        mpv "$file" &
+    done
+fi
